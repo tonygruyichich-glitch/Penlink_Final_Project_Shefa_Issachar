@@ -1,0 +1,7 @@
+.DS_Store
+Thumbs.db
+00_Instructions_and_Raw_Data/raw_csv_backups/*.csv
+*.csv
+*credentials*.json
+.env
+~$*
