@@ -5,3 +5,5 @@ Thumbs.db
 *credentials*.json
 .env
 ~$*
+*.db
+*.duckdb
