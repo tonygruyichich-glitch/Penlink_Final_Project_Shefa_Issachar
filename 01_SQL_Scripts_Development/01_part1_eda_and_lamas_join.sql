@@ -154,3 +154,156 @@ FROM ranked_cities
 ORDER BY
     CASE WHEN city_name = 'יבנה' THEN 0 ELSE 1 END ASC,
     supermarkets_per_10k DESC;
+
+
+
+/* ==============================================================================
+   Summary Metric 2: Hourly Unique Customer Traffic (Central Tendency & Dispersion)
+    analytical Goal: Identify true operating hours, peak congestion windows, and
+                    compare customer presence vs. staff presence across the day.
+   ============================================================================== */
+
+-- Step 1: Count unique customers and staff per specific Date AND Hour
+WITH daily_hourly_traffic AS (
+    SELECT
+    DATE(timestamp) AS visit_date,
+    EXTRACT(HOUR FROM timestamp) AS hour_of_day,
+
+-- Count unique customer devices (excluding employees and suppliers)
+    COUNT(DISTINCT CASE
+    WHEN role IN ('repeat_customer', 'one_time_customer', 'not_paying') THEN device_id
+    END) AS unique_customers,
+
+-- Count unique paying vs. non-paying visitors for conversion context
+    COUNT(DISTINCT CASE
+    WHEN role IN ('repeat_customer', 'one_time_customer') THEN device_id
+    END) AS unique_paying_customers,
+
+-- Count unique staff members present in that hour
+    COUNT(DISTINCT CASE
+    WHEN role NOT IN ('repeat_customer', 'one_time_customer', 'not_paying') THEN device_id
+    END) AS unique_staff
+FROM `bqproj26.Final_Project_2026.geolocation`
+-- Keep clean signal pings (<= 30m) to avoid false perimeter detections
+WHERE accuracy_m <= 30
+GROUP BY
+    visit_date,
+    hour_of_day
+    )
+
+-- Step 2: Aggregate across all active days to compute hourly Mean, SD, Median, and IQR
+SELECT
+    hour_of_day,
+    COUNT(DISTINCT visit_date) AS active_days_observed,
+
+    -- Customer Traffic: Central Tendency & Dispersion
+    ROUND(AVG(unique_customers), 2) AS mean_customers,
+    ROUND(STDDEV(unique_customers), 2) AS sd_customers,
+    APPROX_QUANTILES(unique_customers, 4)[OFFSET(0)] AS min_customers,
+    APPROX_QUANTILES(unique_customers, 4)[OFFSET(1)] AS q1_customers,
+    APPROX_QUANTILES(unique_customers, 4)[OFFSET(2)] AS median_customers,
+    APPROX_QUANTILES(unique_customers, 4)[OFFSET(3)] AS q3_customers,
+    APPROX_QUANTILES(unique_customers, 4)[OFFSET(4)] AS max_customers,
+    (APPROX_QUANTILES(unique_customers, 4)[OFFSET(3)] - APPROX_QUANTILES(unique_customers, 4)[OFFSET(1)]) AS iqr_customers,
+
+    -- Staff Presence Benchmark
+    ROUND(AVG(unique_staff), 2) AS mean_staff_present,
+
+    -- Customer-to-Staff Ratio (Operational Load Indicator)
+    ROUND(SAFE_DIVIDE(AVG(unique_customers), AVG(unique_staff)), 2) AS customers_per_staff_ratio
+FROM daily_hourly_traffic
+GROUP BY hour_of_day
+ORDER BY hour_of_day ASC;
+
+
+
+
+/* ==============================================================================
+   Summary Metric 3: Basket Revenue (`total`), Dwell Time (`dwell_minutes`), and
+                     Spend Velocity (`ils_per_minute`) by Segment & Payment Method
+   ============================================================================== */
+
+-- Step 1: Extract unique customer-to-role mapping from `geolocation` (1 row per device)
+WITH unique_device_roles AS (
+    SELECT DISTINCT
+        device_id,
+        role
+    FROM `bqproj26.Final_Project_2026.geolocation`
+),
+
+-- Step 2: Enrich `log_sales` with customer segment and engineered Spend Velocity metric
+     enriched_sales AS (
+         SELECT
+             s.sale_id,
+             s.timestamp,
+             s.customer_id,
+             COALESCE(g.role, 'no_phone_anonymous') AS customer_segment,
+             s.payment_method,
+             s.total,
+             s.dwell_minutes,
+             -- Engineered Feature: Spend Velocity (ILS spent per minute inside the store)
+             ROUND(SAFE_DIVIDE(s.total, s.dwell_minutes), 2) AS ils_per_minute
+         FROM `bqproj26.Final_Project_2026.log_sales` AS s
+                  LEFT JOIN unique_device_roles AS g
+                            ON s.customer_id = g.device_id
+     )
+
+-- Step 3A: Summary Statistics by Customer Segment
+SELECT
+    '1_By_Customer_Segment' AS breakdown_dimension,
+    customer_segment AS category,
+    COUNT(*) AS transactions_count,
+    ROUND(SAFE_DIVIDE(COUNT(*) * 100.0, SUM(COUNT(*)) OVER ()), 2) AS pct_of_transactions,
+    ROUND(SUM(total), 2) AS total_revenue_ils,
+    ROUND(SAFE_DIVIDE(SUM(total) * 100.0, SUM(SUM(total)) OVER ()), 2) AS pct_of_revenue,
+
+    -- Basket Size (`total` ILS): Central Tendency & Dispersion
+    ROUND(AVG(total), 2) AS mean_basket_ils,
+    ROUND(STDDEV(total), 2) AS sd_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(1)], 2) AS q1_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(2)], 2) AS median_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(3)], 2) AS q3_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(3)] - APPROX_QUANTILES(total, 4)[OFFSET(1)], 2) AS iqr_basket_ils,
+
+    -- Dwell Time (`dwell_minutes`): Central Tendency & Dispersion
+    ROUND(AVG(dwell_minutes), 1) AS mean_dwell_min,
+    ROUND(STDDEV(dwell_minutes), 1) AS sd_dwell_min,
+    APPROX_QUANTILES(dwell_minutes, 4)[OFFSET(2)] AS median_dwell_min,
+    (APPROX_QUANTILES(dwell_minutes, 4)[OFFSET(3)] - APPROX_QUANTILES(dwell_minutes, 4)[OFFSET(1)]) AS iqr_dwell_min,
+
+    -- Engineered Metric: Spend Velocity (ILS per Minute)
+    ROUND(AVG(ils_per_minute), 2) AS mean_ils_per_min,
+    ROUND(APPROX_QUANTILES(ils_per_minute, 4)[OFFSET(2)], 2) AS median_ils_per_min
+FROM enriched_sales
+GROUP BY customer_segment
+
+UNION ALL
+
+-- Step 3B: Summary Statistics by Payment Method
+SELECT
+    '2_By_Payment_Method' AS breakdown_dimension,
+    payment_method AS category,
+    COUNT(*) AS transactions_count,
+    ROUND(SAFE_DIVIDE(COUNT(*) * 100.0, SUM(COUNT(*)) OVER ()), 2) AS pct_of_transactions,
+    ROUND(SUM(total), 2) AS total_revenue_ils,
+    ROUND(SAFE_DIVIDE(SUM(total) * 100.0, SUM(SUM(total)) OVER ()), 2) AS pct_of_revenue,
+
+    ROUND(AVG(total), 2) AS mean_basket_ils,
+    ROUND(STDDEV(total), 2) AS sd_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(1)], 2) AS q1_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(2)], 2) AS median_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(3)], 2) AS q3_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(3)] - APPROX_QUANTILES(total, 4)[OFFSET(1)], 2) AS iqr_basket_ils,
+
+    ROUND(AVG(dwell_minutes), 1) AS mean_dwell_min,
+    ROUND(STDDEV(dwell_minutes), 1) AS sd_dwell_min,
+    APPROX_QUANTILES(dwell_minutes, 4)[OFFSET(2)] AS median_dwell_min,
+    (APPROX_QUANTILES(dwell_minutes, 4)[OFFSET(3)] - APPROX_QUANTILES(dwell_minutes, 4)[OFFSET(1)]) AS iqr_dwell_min,
+
+    ROUND(AVG(ils_per_minute), 2) AS mean_ils_per_min,
+    ROUND(APPROX_QUANTILES(ils_per_minute, 4)[OFFSET(2)], 2) AS median_ils_per_min
+FROM enriched_sales
+GROUP BY payment_method
+ORDER BY
+    breakdown_dimension ASC,
+    total_revenue_ils DESC;
