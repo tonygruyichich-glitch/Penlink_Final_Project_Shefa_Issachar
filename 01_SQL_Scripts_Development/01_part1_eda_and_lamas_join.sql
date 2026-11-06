@@ -482,3 +482,204 @@ SELECT
     avg_basket_in_bin_ils
 FROM dwell_binned
 ORDER BY bin_floor_min ASC;
+
+
+
+
+/* ==============================================================================
+   Part 1 - Multivariate Chart 1 (3 Variables):
+   Hour of Day x Day of Week x Unique Customer Devices
+   Analytical Goal: Build a 2D spatiotemporal traffic matrix (Day of Week x Hour)
+                    to uncover weekday vs. Thursday/Friday behavioral patterns,
+                    peak congestion windows, and "dead zones".
+   ============================================================================== */
+
+-- Step 1: Count unique customer devices per specific calendar date and hour
+WITH daily_hourly_customer_counts AS (
+    SELECT
+    DATE(timestamp) AS visit_date,
+    EXTRACT(DAYOFWEEK FROM DATE(timestamp)) AS day_of_week_num, -- 1=Sun, 2=Mon, ..., 6=Fri, 7=Sat
+    EXTRACT(HOUR FROM timestamp) AS hour_of_day,
+    COUNT(DISTINCT device_id) AS unique_customer_devices,
+    COUNT(DISTINCT CASE WHEN role = 'repeat_customer' THEN device_id END) AS repeat_customers,
+    COUNT(DISTINCT CASE WHEN role = 'one_time_customer' THEN device_id END) AS one_time_customers,
+    COUNT(DISTINCT CASE WHEN role = 'not_paying' THEN device_id END) AS non_paying_visitors
+FROM `bqproj26.Final_Project_2026.geolocation`
+WHERE role IN ('repeat_customer', 'one_time_customer', 'not_paying')
+  AND accuracy_m <= 30
+GROUP BY
+    visit_date,
+    day_of_week_num,
+    hour_of_day
+    )
+
+-- Step 2: Aggregate across dates to get Mean & Median customers per (Day of Week x Hour)
+SELECT
+    day_of_week_num,
+    CASE day_of_week_num
+        WHEN 1 THEN '1_Sunday (ראשון)'
+        WHEN 2 THEN '2_Monday (שני)'
+        WHEN 3 THEN '3_Tuesday (שלישי)'
+        WHEN 4 THEN '4_Wednesday (רביעי)'
+        WHEN 5 THEN '5_Thursday (חמישי)'
+        WHEN 6 THEN '6_Friday (שישי)'
+        WHEN 7 THEN '7_Saturday (שבת)'
+        END AS day_name,
+    hour_of_day,
+    COUNT(DISTINCT visit_date) AS active_days_sampled,
+
+    -- Central Tendency & Peak Metrics for Customer Devices
+    ROUND(AVG(unique_customer_devices), 2) AS mean_customer_devices,
+    APPROX_QUANTILES(unique_customer_devices, 4)[OFFSET(2)] AS median_customer_devices,
+    MAX(unique_customer_devices) AS max_customer_devices,
+
+    -- Segment Breakdown within each (Day x Hour) cell
+    ROUND(AVG(repeat_customers), 2) AS mean_repeat_customers,
+    ROUND(AVG(one_time_customers), 2) AS mean_one_time_customers,
+    ROUND(AVG(non_paying_visitors), 2) AS mean_non_paying_visitors
+FROM daily_hourly_customer_counts
+GROUP BY
+    day_of_week_num,
+    day_name,
+    hour_of_day
+ORDER BY
+    day_of_week_num ASC,
+    hour_of_day ASC;
+
+
+
+
+/* ==============================================================================
+   Part 1 - Multivariate Chart 2 (3 Variables):
+   Dwell Time (`dwell_minutes`) x Basket Value (`total`) x Customer Segment (`role`)
+   Analytical Goal: Test whether the linear relationship between dwell time and
+                    basket value differs across customer segments (Repeat vs. One-Time)
+                    and payment types (Cards vs. Cash/Mobile).
+   ============================================================================== */
+
+WITH unique_customer_roles AS (
+    SELECT DISTINCT
+        device_id,
+        role
+    FROM `bqproj26.Final_Project_2026.geolocation`
+),
+
+     sales_with_segment AS (
+         SELECT
+             s.sale_id,
+             s.total,
+             s.dwell_minutes,
+             CAST(FLOOR(s.dwell_minutes / 10.0) * 10 AS INT64) AS dwell_bin_10m,
+             g.role AS customer_segment,
+             CASE
+                 WHEN s.payment_method IN ('credit_card', 'debit_card') THEN 'Card (Credit/Debit)'
+                 ELSE 'Fast Pay (Mobile/Cash)'
+                 END AS payment_group
+         FROM `bqproj26.Final_Project_2026.log_sales` AS s
+                  INNER JOIN unique_customer_roles AS g
+                             ON s.customer_id = g.device_id
+         WHERE s.dwell_minutes IS NOT NULL
+           AND s.total IS NOT NULL
+     )
+
+SELECT
+    dwell_bin_10m,
+    CONCAT(
+            LPAD(CAST(dwell_bin_10m AS STRING), 3, '0'),
+            '-',
+            LPAD(CAST(dwell_bin_10m + 9 AS STRING), 3, '0'),
+            ' Min'
+    ) AS dwell_interval,
+    customer_segment,
+    COUNT(*) AS tx_count,
+
+    -- Basket Value Metrics per (Dwell Bin x Customer Segment)
+    ROUND(AVG(total), 2) AS mean_basket_ils,
+    ROUND(STDDEV(total), 2) AS sd_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(1)], 2) AS q1_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(2)], 2) AS median_basket_ils,
+    ROUND(APPROX_QUANTILES(total, 4)[OFFSET(3)], 2) AS q3_basket_ils,
+
+    -- Spend Velocity (ILS per Minute) within each cell
+    ROUND(AVG(SAFE_DIVIDE(total, dwell_minutes)), 2) AS mean_ils_per_min,
+
+    -- Share of Card Payments vs. Fast Pay within each (Dwell Bin x Segment)
+    ROUND(SAFE_DIVIDE(COUNTIF(payment_group = 'Card (Credit/Debit)') * 100.0, COUNT(*)), 1) AS pct_card_payments
+FROM sales_with_segment
+GROUP BY
+    dwell_bin_10m,
+    dwell_interval,
+    customer_segment
+ORDER BY
+    dwell_bin_10m ASC,
+    customer_segment ASC;
+
+
+
+
+/* ==============================================================================
+   Part 1 - Multivariate Chart 3 (3 Variables):
+   Store Zone (`area`) x Hour of Day (`hour_of_day`) x Customer & Staff Load
+   Analytical Goal: Analyze the spatiotemporal flow of customers across store zones
+                    (PARKING, SUPERMARKET, BUTCHERY, CASH_REGISTERS) by hour, and
+                    quantify bottleneck ratios (Customers per Cashier / Butcher).
+   ============================================================================== */
+
+-- Step 1: Count unique customers and dedicated staff per Date, Hour, and Store Zone (`area`)
+WITH daily_hourly_zone_load AS (
+    SELECT
+    DATE(timestamp) AS visit_date,
+    EXTRACT(HOUR FROM timestamp) AS hour_of_day,
+    area,
+
+-- Unique customers detected in this zone during this hour
+    COUNT(DISTINCT CASE
+    WHEN role IN ('repeat_customer', 'one_time_customer', 'not_paying') THEN device_id
+    END) AS zone_customers,
+
+-- Total customer signal pings in this zone (measuring cumulative time/dwell volume)
+    COUNTIF(role IN ('repeat_customer', 'one_time_customer', 'not_paying')) AS zone_customer_pings,
+
+-- Dedicated staff present in this zone during this hour
+    COUNT(DISTINCT CASE
+    WHEN role NOT IN ('repeat_customer', 'one_time_customer', 'not_paying') THEN device_id
+    END) AS zone_staff
+FROM `bqproj26.Final_Project_2026.geolocation`
+WHERE accuracy_m <= 30
+  AND EXTRACT(HOUR FROM timestamp) BETWEEN 8 AND 20
+GROUP BY
+    visit_date,
+    hour_of_day,
+    area
+    )
+
+-- Step 2: Aggregate across active days (151 days) to get Mean Load per (Hour x Zone)
+SELECT
+    hour_of_day,
+    area,
+    COUNT(DISTINCT visit_date) AS active_days_with_zone_activity,
+
+    -- Customer & Staff Presence Averages
+    ROUND(AVG(zone_customers), 2) AS mean_zone_customers,
+    APPROX_QUANTILES(zone_customers, 4)[OFFSET(2)] AS median_zone_customers,
+    MAX(zone_customers) AS max_zone_customers,
+
+    ROUND(AVG(zone_customer_pings), 1) AS mean_customer_pings_in_zone,
+    ROUND(AVG(zone_staff), 2) AS mean_zone_staff,
+
+    -- Operational Congestion Ratio: Customers per Staff Member inside that specific zone
+    ROUND(SAFE_DIVIDE(AVG(zone_customers), AVG(zone_staff)), 2) AS zone_customers_per_staff
+FROM daily_hourly_zone_load
+WHERE area IN ('PARKING', 'SUPERMARKET', 'BUTCHERY', 'CASH_REGISTERS')
+GROUP BY
+    hour_of_day,
+    area
+ORDER BY
+    hour_of_day ASC,
+    CASE area
+        WHEN 'PARKING' THEN 1
+        WHEN 'SUPERMARKET' THEN 2
+        WHEN 'BUTCHERY' THEN 3
+        WHEN 'CASH_REGISTERS' THEN 4
+        ELSE 5
+        END ASC;
