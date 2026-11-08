@@ -191,3 +191,49 @@ ORDER BY
   vip_award_category ASC,
   rank_by_frequency ASC,
   rank_by_spend ASC;
+
+
+
+
+-- ==============================================================================
+-- Query 6: Real vs. Declared Store Operating Hours (Day of Week x Hour x Customers)
+-- ==============================================================================
+WITH daily_hourly_presence AS (
+  SELECT
+    DATE(timestamp) AS visit_date,
+    EXTRACT(DAYOFWEEK FROM DATE(timestamp)) AS day_of_week_num, -- 1=Sun .. 6=Fri
+    EXTRACT(HOUR FROM timestamp) AS hour_of_day,
+    -- Count all tracked customer devices present in the store (including >30m accuracy)
+    COUNT(DISTINCT CASE WHEN role IN ('repeat_customer', 'one_time_customer', 'not_paying') THEN device_id END) AS customer_devices_all,
+    COUNT(DISTINCT CASE WHEN role IN ('repeat_customer', 'one_time_customer', 'not_paying') AND accuracy_m <= 30 THEN device_id END) AS customer_devices_clean,
+    COUNT(DISTINCT CASE WHEN role NOT IN ('repeat_customer', 'one_time_customer', 'not_paying', 'delivery_guy') THEN device_id END) AS staff_devices
+  FROM `bqproj26.Final_Project_2026.geolocation`
+  GROUP BY visit_date, day_of_week_num, hour_of_day
+)
+
+SELECT
+  day_of_week_num,
+  CASE day_of_week_num
+    WHEN 1 THEN '1_Sunday'
+    WHEN 2 THEN '2_Monday'
+    WHEN 3 THEN '3_Tuesday'
+    WHEN 4 THEN '4_Wednesday'
+    WHEN 5 THEN '5_Thursday'
+    WHEN 6 THEN '6_Friday'
+  END AS day_name,
+  hour_of_day,
+  COUNT(DISTINCT visit_date) AS days_observed,
+  ROUND(AVG(customer_devices_all), 2) AS mean_customers_all,
+  ROUND(AVG(customer_devices_clean), 2) AS mean_customers_clean_le30m,
+  APPROX_QUANTILES(customer_devices_all, 4)[OFFSET(2)] AS median_customers_all,
+  MAX(customer_devices_all) AS max_customers_all,
+  ROUND(AVG(staff_devices), 2) AS mean_staff_devices,
+  CASE
+    WHEN AVG(customer_devices_all) >= 80 THEN 'PEAK_CONGESTION_HOUR'
+    WHEN AVG(customer_devices_all) >= 15 THEN 'ACTIVE_SHOPPING_HOUR'
+    WHEN AVG(customer_devices_all) > 0 THEN 'MARGINAL_EXIT_TAIL_HOUR'
+    ELSE 'DEAD_HOUR_ZERO_CUSTOMERS (פתוח לצוות בלבד - 0 לקוחות)'
+  END AS operational_hour_status
+FROM daily_hourly_presence
+GROUP BY day_of_week_num, day_name, hour_of_day
+ORDER BY day_of_week_num ASC, hour_of_day ASC;
